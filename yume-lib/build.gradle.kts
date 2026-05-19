@@ -3,6 +3,24 @@ plugins {
     id("maven-publish")
 }
 
+val baseVersion = providers.gradleProperty("yumeLib.version").getOrElse("0.0.0")
+
+val gitTag = providers.exec {
+    workingDir = rootProject.projectDir
+    commandLine("git", "describe", "--tags", "--match", "v*", "--abbrev=0")
+}.standardOutput.asText.map { it.trim().removePrefix("v") }
+
+val gitCommitHash = providers.exec {
+    workingDir = rootProject.projectDir
+    commandLine("git", "rev-parse", "--short", "HEAD")
+}.standardOutput.asText.map { it.trim() }
+
+val libVersion = runCatching {
+    val tag = gitTag.get()
+    if (tag == baseVersion) baseVersion
+    else "$baseVersion-SNAPSHOT.${gitCommitHash.get()}"
+}.getOrDefault("$baseVersion-SNAPSHOT.${gitCommitHash.getOrElse("unknown")}")
+
 android {
     namespace = "io.github.sakurafubuki.yume.nativelib"
 
@@ -89,12 +107,6 @@ dependencies {
     implementation(libs.kotlinx.coroutines.android)
 }
 
-val gitTagVersion = providers.exec {
-    workingDir = rootProject.projectDir
-    commandLine("git", "describe", "--tags", "--match", "v*", "--abbrev=0")
-}.standardOutput.asText.map { it.trim().removePrefix("v") }
-
-val libVersion = runCatching { gitTagVersion.get() }.getOrDefault("0.0.0")
 val libGroup = "io.github.sakurafubuki.yume"
 val libArtifact = "yume-lib"
 
