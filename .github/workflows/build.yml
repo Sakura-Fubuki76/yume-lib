@@ -1,0 +1,216 @@
+name: Build yume-lib
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  build-prebuilds:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [arm64, armv7l, x86, x86_64]
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compute cache keys
+        run: |
+          HASH=$(sha256sum buildscripts/include/depinfo.sh | cut -c1-16)
+          echo "CACHE_HASH=$HASH" >> $GITHUB_ENV
+
+      - name: Cache SDK & NDK
+        uses: actions/cache@v5
+        with:
+          path: buildscripts/sdk
+          key: yume-lib-sdk-${{ env.CACHE_HASH }}
+          restore-keys: yume-lib-sdk-
+
+      - name: Cache deps sources
+        uses: actions/cache@v5
+        with:
+          path: buildscripts/deps
+          key: yume-lib-deps-${{ env.CACHE_HASH }}
+          restore-keys: yume-lib-deps-
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y autoconf pkgconf libtool ninja-build python3-pip gperf nasm
+          pipx install meson
+
+      - name: Download deps
+        run: |
+          cd buildscripts
+          chmod +x download.sh buildall.sh include/*.sh scripts/*.sh
+          bash download.sh
+
+      - name: Build prebuilts (${{ matrix.arch }})
+        run: |
+          cd buildscripts
+          bash buildall.sh --arch ${{ matrix.arch }} all
+
+      - name: Verify prebuilts
+        run: |
+          PREFIX="buildscripts/prefix/${{ matrix.arch }}"
+          echo "=== Static libs (.a) ==="
+          find "$PREFIX/lib" -name "*.a" 2>/dev/null | sort || echo "(none)"
+          echo ""
+          echo "=== Shared libs (.so) ==="
+          find "$PREFIX/lib" -name "*.so" 2>/dev/null | sort || echo "(none)"
+          echo ""
+
+          MISSING=""
+          for lib in libavcodec libavformat libavutil libswresample libswscale; do
+            if [ ! -f "$PREFIX/lib/${lib}.so" ]; then
+              MISSING="$MISSING $lib"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo "::error::Missing FFmpeg shared libraries:$MISSING"
+            echo "FFmpeg build log:"
+            cat buildscripts/deps/ffmpeg/_build-${{ matrix.arch }}/ffbuild/config.log 2>/dev/null | tail -50 || echo "(no config.log)"
+            exit 1
+          fi
+
+          echo "All required .so files present."
+
+      - name: Package prebuilts
+        run: |
+          cd buildscripts/prefix
+          tar -czf "${{ github.workspace }}/prebuilts-${{ matrix.arch }}.tar.gz" "${{ matrix.arch }}"
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: prebuilts-${{ matrix.arch }}
+          path: prebuilts-${{ matrix.arch }}.tar.gz
+          retention-days: 1
+
+  build-aar:
+    needs: build-prebuilds
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download deps
+        run: |
+          cd buildscripts
+          chmod +x download.sh include/*.sh scripts/*.sh
+          bash download.sh
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Download all prebuilts
+        uses: actions/download-artifact@v6
+        with:
+          pattern: prebuilts-*
+          path: buildscripts/prefix
+          merge-multiple: true
+
+      - name: Extract prebuilts
+        run: |
+          cd buildscripts/prefix
+          for arch in arm64 armv7l x86 x86_64; do
+            tar -xzf "prebuilts-${arch}.tar.gz"
+          done
+          ls -la
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Build AAR
+        run: |
+          chmod +x gradlew
+          ./gradlew :yume-lib:assembleRelease
+
+      - name: Verify AAR
+        run: |
+          echo "=== .so files in AAR ==="
+          unzip -l yume-lib/build/outputs/aar/yume-lib-release.aar | grep '\.so' | \
+            awk '{print $NF}' | sed 's|.*/||' | sort | uniq -c | sort -rn
+          so_count=$(unzip -l yume-lib/build/outputs/aar/yume-lib-release.aar | grep -c '\.so')
+          echo "Total .so: $so_count"
+          if [ "$so_count" -lt 44 ]; then
+            echo "ERROR: Too few .so files!"
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: yume-lib-release-aar
+          path: yume-lib/build/outputs/aar/yume-lib-release.aar
+          retention-days: 90
+
+  release:
+    needs: build-aar
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v6
+        with:
+          name: yume-lib-release-aar
+
+      - name: Rename AAR
+        run: mv yume-lib-release.aar yume-lib-${{ github.ref_name }}.aar
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: yume-lib-${{ github.ref_name }}.aar
+          draft: false
+          generate_release_notes: true
+
+  publish-maven:
+    needs: build-aar
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download deps (including libyuv & soundtouch)
+        run: |
+          cd buildscripts
+          chmod +x download.sh include/*.sh scripts/*.sh
+          bash download.sh
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Download all prebuilts
+        uses: actions/download-artifact@v6
+        with:
+          pattern: prebuilts-*
+          path: buildscripts/prefix
+          merge-multiple: true
+
+      - name: Extract prebuilts
+        run: |
+          cd buildscripts/prefix
+          for arch in arm64 armv7l x86 x86_64; do
+            tar -xzf "prebuilts-${arch}.tar.gz"
+          done
+
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Publish to GitHub Packages
+        run: |
+          chmod +x gradlew
+          ./gradlew :yume-lib:publish
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

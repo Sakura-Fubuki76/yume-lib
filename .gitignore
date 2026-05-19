@@ -1,0 +1,20 @@
+.gradle/
+build/
+.idea/
+*.iml
+local.properties
+
+# Build script outputs
+buildscripts/sdk/
+buildscripts/deps/
+buildscripts/prefix/
+
+# C/C++ build artifacts
+.cxx/
+*.o
+*.so
+*.a
+
+# OS files
+.DS_Store
+Thumbs.db
