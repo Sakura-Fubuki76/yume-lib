@@ -223,7 +223,12 @@ struct AssContext {
     PboRing pboRing;
 
     std::vector<const ASS_Image*> frameImages;
+    std::vector<float> instanceData;
+    std::vector<size_t> uploadOffsets;
+    std::vector<int> uploadWidths;
+    std::vector<int> uploadHeights;
     std::vector<uint8_t> fallbackBuf;
+    bool frameDirty = true;
 
     AssContext() = default;
     ~AssContext() {
@@ -395,21 +400,38 @@ struct AssContext {
 
     bool setSurface(ANativeWindow* win) {
         destroyGL();
+        frameDirty = true;
         if (!win) return true;
         if (!initEGL(win))      return false;
         if (!initGLResources()) { destroyEGL(); return false; }
         return true;
     }
 
+    void clearSurface() {
+        eglMakeCurrent(egl.display, egl.surface, egl.surface, egl.context);
+        glViewport(0, 0, width, height);
+        glClearColor(0.f, 0.f, 0.f, 0.f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        eglSwapBuffers(egl.display, egl.surface);
+    }
+
     void renderFrame(long long timeMs) {
         if (!egl.valid()) return;
 #if HAS_LIBASS
-        if (!renderer || !track) return;
+        if (!renderer || !track) {
+            if (frameDirty) {
+                clearSurface();
+                frameDirty = false;
+            }
+            return;
+        }
         int changed = 0;
         ASS_Image* head = ass_render_frame(renderer, track, timeMs, &changed);
 #else
+        int changed = 0;
         ASS_Image* head = nullptr;
 #endif
+        if (!frameDirty && changed == 0) return;
         eglMakeCurrent(egl.display, egl.surface, egl.surface, egl.context);
 
         glViewport(0, 0, width, height);
@@ -429,23 +451,40 @@ struct AssContext {
         int n = static_cast<int>(frameImages.size());
         if (n == 0) {
             eglSwapBuffers(egl.display, egl.surface);
+            frameDirty = false;
             return;
         }
 
-        ensureTexArray(maxW, maxH, n);
+        ensureTexArray(maxW + 1, maxH + 1, n);
 
-        int layerBytes = maxW * maxH;
-        int totalBytes = layerBytes * n;
+        uploadOffsets.resize(n);
+        uploadWidths.resize(n);
+        uploadHeights.resize(n);
 
-        std::vector<float> instData(n * 11);
+        size_t totalBytes = 0;
+        for (int idx = 0; idx < n; ++idx) {
+            const ASS_Image* img = frameImages[idx];
+            const int uploadW = img->w < texW ? img->w + 1 : img->w;
+            const int uploadH = img->h < texH ? img->h + 1 : img->h;
+            uploadOffsets[idx] = totalBytes;
+            uploadWidths[idx] = uploadW;
+            uploadHeights[idx] = uploadH;
+            totalBytes += static_cast<size_t>(uploadW) * static_cast<size_t>(uploadH);
+        }
+        if (totalBytes > static_cast<size_t>(0x7fffffff)) {
+            LOGE("ASS texture upload is too large: %zu bytes", totalBytes);
+            return;
+        }
+
+        instanceData.resize(n * 11);
         const float uvSX = texW > 0 ? 1.f / static_cast<float>(texW) : 1.f;
         const float uvSY = texH > 0 ? 1.f / static_cast<float>(texH) : 1.f;
 
-        uint8_t* pboPtr = pboRing.mapWrite(totalBytes);
+        uint8_t* pboPtr = pboRing.mapWrite(static_cast<GLsizei>(totalBytes));
 
         for (int idx = 0; idx < n; ++idx) {
             const ASS_Image* img = frameImages[idx];
-            float* dst = instData.data() + idx * 11;
+            float* dst = instanceData.data() + idx * 11;
             dst[0] = static_cast<float>(img->dst_x);
             dst[1] = static_cast<float>(img->dst_y);
             dst[2] = static_cast<float>(img->w);
@@ -459,10 +498,12 @@ struct AssContext {
             dst[10]= static_cast<float>(img->h)  * uvSY;
 
             if (pboPtr) {
-                size_t off = static_cast<size_t>(idx) * layerBytes;
-                memset(pboPtr + off, 0, layerBytes);
+                const size_t off = uploadOffsets[idx];
+                const int uploadW = uploadWidths[idx];
+                const int uploadH = uploadHeights[idx];
+                memset(pboPtr + off, 0, static_cast<size_t>(uploadW) * static_cast<size_t>(uploadH));
                 for (int row = 0; row < img->h; ++row)
-                    memcpy(pboPtr + off + row * maxW,
+                    memcpy(pboPtr + off + static_cast<size_t>(row) * uploadW,
                            img->bitmap + row * img->stride, img->w);
             }
         }
@@ -471,24 +512,27 @@ struct AssContext {
             pboRing.unmap();
             for (int idx = 0; idx < n; ++idx) {
                 glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0,
-                                0, 0, idx, maxW, maxH, 1,
+                                0, 0, idx, uploadWidths[idx], uploadHeights[idx], 1,
                                 GL_RED, GL_UNSIGNED_BYTE,
                                 reinterpret_cast<void*>(
                                     static_cast<GLintptr>(
-                                        static_cast<size_t>(idx) * static_cast<size_t>(layerBytes))));
+                                        uploadOffsets[idx])));
             }
             pboRing.swap();
         } else {
-            if (static_cast<int>(fallbackBuf.size()) < layerBytes)
-                fallbackBuf.resize(layerBytes);
             for (int idx = 0; idx < n; ++idx) {
                 const ASS_Image* img = frameImages[idx];
-                memset(fallbackBuf.data(), 0, layerBytes);
+                const int uploadW = uploadWidths[idx];
+                const int uploadH = uploadHeights[idx];
+                const size_t uploadBytes = static_cast<size_t>(uploadW) * static_cast<size_t>(uploadH);
+                if (fallbackBuf.size() < uploadBytes)
+                    fallbackBuf.resize(uploadBytes);
+                memset(fallbackBuf.data(), 0, uploadBytes);
                 for (int row = 0; row < img->h; ++row)
-                    memcpy(fallbackBuf.data() + row * maxW,
+                    memcpy(fallbackBuf.data() + static_cast<size_t>(row) * uploadW,
                            img->bitmap + row * img->stride, img->w);
                 glTexSubImage3D(GL_TEXTURE_2D_ARRAY, 0,
-                                0, 0, idx, maxW, maxH, 1,
+                                0, 0, idx, uploadW, uploadH, 1,
                                 GL_RED, GL_UNSIGNED_BYTE, fallbackBuf.data());
             }
         }
@@ -499,7 +543,7 @@ struct AssContext {
             glBufferData(GL_ARRAY_BUFFER, glInstanceCapacity * 11 * sizeof(float), nullptr, GL_DYNAMIC_DRAW);
         }
         glBindBuffer(GL_ARRAY_BUFFER, glVboInstance);
-        glBufferSubData(GL_ARRAY_BUFFER, 0, n * 11 * sizeof(float), instData.data());
+        glBufferSubData(GL_ARRAY_BUFFER, 0, n * 11 * sizeof(float), instanceData.data());
         glBindBuffer(GL_ARRAY_BUFFER, 0);
 
         glEnable(GL_BLEND);
@@ -515,6 +559,7 @@ struct AssContext {
         glBindVertexArray(0);
 
         eglSwapBuffers(egl.display, egl.surface);
+        frameDirty = false;
     }
 };
 
@@ -560,6 +605,7 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeSetFontsDir(
         scan_fonts_dir(ctx->lib, p);
         if (ctx->renderer)
             ass_set_fonts(ctx->renderer, nullptr, "sans-serif", 1, nullptr, 1);
+        ctx->frameDirty = true;
     }
 #endif
     env->ReleaseStringUTFChars(path, p);
@@ -573,6 +619,7 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeLoadTrack(
     if (!ctx) return;
     std::lock_guard<std::mutex> lock(ctx->renderMutex);
     ctx->ycbcrMatrix = 0;
+    ctx->frameDirty = true;
 #if HAS_LIBASS
     if (ctx->track) { ass_free_track(ctx->track); ctx->track = nullptr; }
     if (ctx->lib && data && length > 0) {
@@ -600,6 +647,7 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeCreateAssTrack(
     AssContext* ctx = reinterpret_cast<AssContext*>(handle);
     if (!ctx) return;
     std::lock_guard<std::mutex> lock(ctx->renderMutex);
+    ctx->frameDirty = true;
 #if HAS_LIBASS
     if (ctx->track) { ass_free_track(ctx->track); ctx->track = nullptr; }
     if (ctx->lib) {
@@ -620,6 +668,7 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeProcessAssChunk(
     jbyte* buf = env->GetByteArrayElements(data, nullptr);
     if (!buf) return;
     std::lock_guard<std::mutex> lock(ctx->renderMutex);
+    ctx->frameDirty = true;
 #if HAS_LIBASS
     ass_process_chunk(ctx->track, reinterpret_cast<char*>(buf), length, timecode, duration);
     int rx = ctx->track->PlayResX, ry = ctx->track->PlayResY;
@@ -643,6 +692,7 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeSetSurface(
         LOGE("setSurface failed — GLES3 unavailable");
     if (win && ctx->width > 0 && ctx->height > 0 && ctx->egl.valid())
         glViewport(0, 0, ctx->width, ctx->height);
+    ctx->frameDirty = true;
 }
 
 extern "C" JNIEXPORT void JNICALL
@@ -652,6 +702,7 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeSetStorageSize(
     AssContext* ctx = reinterpret_cast<AssContext*>(handle);
     if (!ctx) return;
     std::lock_guard<std::mutex> lock(ctx->renderMutex);
+    ctx->frameDirty = true;
 #if HAS_LIBASS
     if (ctx->renderer && width > 0 && height > 0)
         ass_set_storage_size(ctx->renderer, width, height);
@@ -666,6 +717,7 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeSetFrameSize(
     if (!ctx) return;
     std::lock_guard<std::mutex> lock(ctx->renderMutex);
     ctx->width = width; ctx->height = height;
+    ctx->frameDirty = true;
 #if HAS_LIBASS
     if (ctx->renderer && width > 0 && height > 0) {
         ass_set_frame_size(ctx->renderer, width, height);
@@ -681,6 +733,7 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeFlushEvents(
     AssContext* ctx = reinterpret_cast<AssContext*>(handle);
     if (!ctx) return;
     std::lock_guard<std::mutex> lock(ctx->renderMutex);
+    ctx->frameDirty = true;
 #if HAS_LIBASS
     if (ctx->track) ass_flush_events(ctx->track);
 #endif
@@ -694,6 +747,7 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeSetStyleOverride
     AssContext* ctx = reinterpret_cast<AssContext*>(handle);
     if (!ctx) return;
     std::lock_guard<std::mutex> lock(ctx->renderMutex);
+    ctx->frameDirty = true;
 #if HAS_LIBASS
     if (!ctx->renderer) return;
     if (!applyEmbeddedStyles) {
@@ -742,8 +796,10 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeAddFont(
     jsize  dataSize = env->GetArrayLength(data);
     std::lock_guard<std::mutex> lock(ctx->renderMutex);
 #if HAS_LIBASS
-    if (ctx->lib && nameStr && fontData && dataSize > 0)
+    if (ctx->lib && nameStr && fontData && dataSize > 0) {
         ass_add_font(ctx->lib, nameStr, reinterpret_cast<char*>(fontData), dataSize);
+        ctx->frameDirty = true;
+    }
 #endif
     if (fontData) env->ReleaseByteArrayElements(data, fontData, JNI_ABORT);
     if (nameStr)  env->ReleaseStringUTFChars(name, nameStr);
@@ -757,9 +813,11 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeRebuildFontCache
     if (!ctx) return;
     std::lock_guard<std::mutex> lock(ctx->renderMutex);
 #if HAS_LIBASS
-    if (ctx->renderer)
+    if (ctx->renderer) {
         ass_set_fonts(ctx->renderer, nullptr, nullptr,
                       ASS_FONTPROVIDER_AUTODETECT, ctx->fontconfigPath, 1);
+        ctx->frameDirty = true;
+    }
 #endif
 }
 
@@ -773,6 +831,7 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeSetFontConfig(
     std::lock_guard<std::mutex> lock(ctx->renderMutex);
     free(ctx->fontconfigPath);
     ctx->fontconfigPath = path ? strdup(path) : nullptr;
+    ctx->frameDirty = true;
 #if HAS_LIBASS
     if (ctx->renderer)
         ass_set_fonts(ctx->renderer, nullptr, nullptr, ASS_FONTPROVIDER_AUTODETECT, path, 1);
