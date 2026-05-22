@@ -62,9 +62,14 @@ static jobject createArgbBitmap(JNIEnv* env, jint width, jint height) {
 struct BitmapLock {
     JNIEnv* env;
     jobject bitmap;
+    AndroidBitmapInfo info;
     void* pixels;
 
-    BitmapLock(JNIEnv* e, jobject b) : env(e), bitmap(b), pixels(nullptr) {
+    BitmapLock(JNIEnv* e, jobject b) : env(e), bitmap(b), info{}, pixels(nullptr) {
+        if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) {
+            pixels = nullptr;
+            return;
+        }
         if (AndroidBitmap_lockPixels(env, bitmap, &pixels) != ANDROID_BITMAP_RESULT_SUCCESS) {
             pixels = nullptr;
         }
@@ -77,6 +82,7 @@ struct BitmapLock {
     }
 
     bool ok() const { return pixels != nullptr; }
+    int stride() const { return static_cast<int>(info.stride); }
 };
 
 extern "C" JNIEXPORT jobject JNICALL
@@ -124,33 +130,37 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_imageToBitmap(
         }
 
         auto* dstPixels = static_cast<uint8_t*>(lock.pixels);
-        const int dstStride = cropWidth * 4;
+        const int dstStride = lock.stride();
         int result = -1;
 
-        if (uPixelStride == 2 && uRowStride == vRowStride) {
-
+        if (!forceNV21) {
+            const uint8_t* srcU = uPtr + (cropTop / 2) * uRowStride
+                                        + (cropLeft / 2) * uPixelStride;
+            const uint8_t* srcV = vPtr + (cropTop / 2) * vRowStride
+                                        + (cropLeft / 2) * vPixelStride;
+            result = libyuv::Android420ToARGBMatrix(
+                srcY, yRowStride,
+                srcU, uRowStride,
+                srcV, vRowStride,
+                uPixelStride,
+                dstPixels, dstStride,
+                matrix,
+                cropWidth, cropHeight);
+            if (result != 0) {
+                LOGE("imageToBitmap: Android420ToARGBMatrix failed with code %d (std=%d range=%d)",
+                     result, colorStandard, colorRange);
+            }
+        } else if (uPixelStride == 2 && uRowStride == vRowStride) {
             const uint8_t* srcUV = uPtr + (cropTop / 2) * uRowStride
                                          + (cropLeft & ~1);
-            if (forceNV21) {
-                result = libyuv::NV21ToARGBMatrix(
-                    srcY, yRowStride,
-                    srcUV, uRowStride,
-                    dstPixels, dstStride,
-                    matrix,
-                    cropWidth, cropHeight);
-                if (result != 0) {
-                    LOGE("imageToBitmap: NV21ToARGBMatrix failed (code %d)", result);
-                }
-            } else {
-                result = libyuv::NV12ToARGBMatrix(
-                    srcY, yRowStride,
-                    srcUV, uRowStride,
-                    dstPixels, dstStride,
-                    matrix,
-                    cropWidth, cropHeight);
-                if (result != 0) {
-                    LOGE("imageToBitmap: NV12ToARGBMatrix failed (code %d)", result);
-                }
+            result = libyuv::NV21ToARGBMatrix(
+                srcY, yRowStride,
+                srcUV, uRowStride,
+                dstPixels, dstStride,
+                matrix,
+                cropWidth, cropHeight);
+            if (result != 0) {
+                LOGE("imageToBitmap: forced NV21ToARGBMatrix failed (code %d)", result);
             }
         } else {
 
@@ -216,7 +226,7 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_bufferToBitmap
         }
 
         auto* dstPixels = static_cast<uint8_t*>(lock.pixels);
-        const int dstStride = cropWidth * 4;
+        const int dstStride = lock.stride();
 
         switch (colorFormat) {
 
@@ -308,6 +318,12 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_i420Scale(
     jint dstWidth, jint dstHeight,
     jint filterMode)
 {
+    if (srcWidth <= 0 || srcHeight <= 0 || dstWidth <= 0 || dstHeight <= 0 ||
+        srcStrideY <= 0 || srcStrideU <= 0 || srcStrideV <= 0 ||
+        dstStrideY <= 0 || dstStrideU <= 0 || dstStrideV <= 0) {
+        return JNI_FALSE;
+    }
+
     auto* pSrcY = static_cast<uint8_t*>(env->GetDirectBufferAddress(srcY));
     auto* pSrcU = static_cast<uint8_t*>(env->GetDirectBufferAddress(srcU));
     auto* pSrcV = static_cast<uint8_t*>(env->GetDirectBufferAddress(srcV));
@@ -352,6 +368,12 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_nv12ScaleToI42
     jint filterMode,
     jboolean forceNV21)
 {
+    if (srcWidth <= 0 || srcHeight <= 0 || dstWidth <= 0 || dstHeight <= 0 ||
+        srcStrideY <= 0 || srcStrideUV <= 0 ||
+        dstStrideY <= 0 || dstStrideU <= 0 || dstStrideV <= 0) {
+        return JNI_FALSE;
+    }
+
     auto* pSrcY  = static_cast<uint8_t*>(env->GetDirectBufferAddress(srcY));
     auto* pSrcUV = static_cast<uint8_t*>(env->GetDirectBufferAddress(srcUV));
     auto* pDstY  = static_cast<uint8_t*>(env->GetDirectBufferAddress(dstY));
@@ -363,10 +385,12 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_nv12ScaleToI42
         return JNI_FALSE;
     }
 
-    const int tmpYSize  = dstStrideY * dstHeight;
-    const int tmpUVSize = dstStrideY * ((dstHeight + 1) / 2);
-    std::vector<uint8_t> tmpY(tmpYSize);
-    std::vector<uint8_t> tmpUV(tmpUVSize);
+    const size_t tmpYSize = static_cast<size_t>(dstStrideY) * static_cast<size_t>(dstHeight);
+    const size_t tmpUVSize = static_cast<size_t>(dstStrideY) * static_cast<size_t>((dstHeight + 1) / 2);
+    thread_local std::vector<uint8_t> tmpY;
+    thread_local std::vector<uint8_t> tmpUV;
+    tmpY.resize(tmpYSize);
+    tmpUV.resize(tmpUVSize);
 
     int ret = libyuv::NV12Scale(
         pSrcY, srcStrideY,
@@ -491,7 +515,7 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_argbScale(
     int result = libyuv::ARGBScale(
         static_cast<uint8_t*>(srcLock.pixels), srcInfo.stride,
         srcInfo.width, srcInfo.height,
-        static_cast<uint8_t*>(dstLock.pixels), dstWidth * 4,
+        static_cast<uint8_t*>(dstLock.pixels), dstLock.stride(),
         dstWidth, dstHeight,
         filter);
 
