@@ -39,23 +39,20 @@ static const libyuv::YuvConstants* selectYuvMatrix(jint colorStandard, jint colo
 }
 
 static jobject createArgbBitmap(JNIEnv* env, jint width, jint height) {
-    jclass bitmapClass = env->FindClass("android/graphics/Bitmap");
-    if (!bitmapClass) return nullptr;
-
-    jmethodID createBitmap = env->GetStaticMethodID(
+    static jclass bitmapClass = (jclass) env->NewGlobalRef(
+        env->FindClass("android/graphics/Bitmap"));
+    static jmethodID createBitmap = env->GetStaticMethodID(
         bitmapClass, "createBitmap",
         "(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;");
-    if (!createBitmap) return nullptr;
-
-    jclass configClass = env->FindClass("android/graphics/Bitmap$Config");
-    if (!configClass) return nullptr;
-
-    jfieldID argb8888Field = env->GetStaticFieldID(
+    static jclass configClass = (jclass) env->NewGlobalRef(
+        env->FindClass("android/graphics/Bitmap$Config"));
+    static jfieldID argb8888Field = env->GetStaticFieldID(
         configClass, "ARGB_8888", "Landroid/graphics/Bitmap$Config;");
-    if (!argb8888Field) return nullptr;
+    static jobject config = env->NewGlobalRef(
+        env->GetStaticObjectField(configClass, argb8888Field));
 
-    jobject config = env->GetStaticObjectField(configClass, argb8888Field);
-    if (!config) return nullptr;
+    if (!bitmapClass || !createBitmap || !configClass || !argb8888Field || !config)
+        return nullptr;
 
     return env->CallStaticObjectMethod(bitmapClass, createBitmap, width, height, config);
 }
@@ -539,17 +536,13 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_compositeToShe
         return JNI_FALSE;
     }
 
-    const int srcStride = frameInfo.stride;
-    const int dstStride = sheetInfo.stride;
-    const int bytesPerRow = frameWidth * 4;
     const int dstX = col * frameWidth * 4;
     const int dstY = row * frameHeight;
 
-    for (int y = 0; y < frameHeight; y++) {
-        memcpy(sheetPixels + (dstY + y) * dstStride + dstX,
-               framePixels + y * srcStride,
-               bytesPerRow);
-    }
+    libyuv::ARGBCopy(
+        framePixels, frameInfo.stride,
+        sheetPixels + dstY * sheetInfo.stride + dstX, sheetInfo.stride,
+        frameWidth, frameHeight);
 
     AndroidBitmap_unlockPixels(env, sheetBitmap);
     AndroidBitmap_unlockPixels(env, frameBitmap);
