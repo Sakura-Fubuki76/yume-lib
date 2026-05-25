@@ -3,6 +3,7 @@
 #include <libyuv.h>
 #include <android/log.h>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <vector>
 
@@ -356,6 +357,75 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_i420Scale(
 }
 
 extern "C" JNIEXPORT jboolean JNICALL
+Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_i420IsMostlySolidColor(
+    JNIEnv* env, jclass,
+    jobject yBuf, jint yRowStride,
+    jobject uBuf, jint uRowStride,
+    jobject vBuf, jint vRowStride,
+    jint width, jint height,
+    jfloat threshold,
+    jint tolerance)
+{
+    if (width <= 0 || height <= 0 || yRowStride <= 0 || uRowStride <= 0 || vRowStride <= 0) {
+        return JNI_FALSE;
+    }
+
+    auto* yPtr = static_cast<uint8_t*>(env->GetDirectBufferAddress(yBuf));
+    auto* uPtr = static_cast<uint8_t*>(env->GetDirectBufferAddress(uBuf));
+    auto* vPtr = static_cast<uint8_t*>(env->GetDirectBufferAddress(vBuf));
+    if (!yPtr || !uPtr || !vPtr) {
+        LOGE("i420IsMostlySolidColor: one or more planes are not direct buffers");
+        return JNI_FALSE;
+    }
+
+    const int marginX = width / 10;
+    const int marginY = height / 10;
+    const int sampleAreaRight = width - marginX;
+    const int sampleAreaBottom = height - marginY;
+    constexpr int gridSize = 10;
+    const int stepX = (sampleAreaRight - marginX) / gridSize;
+    const int stepY = (sampleAreaBottom - marginY) / gridSize;
+    if (stepX <= 0 || stepY <= 0) {
+        return JNI_FALSE;
+    }
+
+    const int refX = marginX;
+    const int refY = marginY;
+    const int refYValue = yPtr[refY * yRowStride + refX];
+    const int refUValue = uPtr[(refY / 2) * uRowStride + refX / 2];
+    const int refVValue = vPtr[(refY / 2) * vRowStride + refX / 2];
+
+    int sampledCount = 0;
+    int similarCount = 0;
+    for (int x = 0; x < gridSize; x++) {
+        for (int y = 0; y < gridSize; y++) {
+            const int pixelX = marginX + x * stepX;
+            const int pixelY = marginY + y * stepY;
+            if (pixelX >= width || pixelY >= height) {
+                continue;
+            }
+
+            const int yValue = yPtr[pixelY * yRowStride + pixelX];
+            const int uValue = uPtr[(pixelY / 2) * uRowStride + pixelX / 2];
+            const int vValue = vPtr[(pixelY / 2) * vRowStride + pixelX / 2];
+            sampledCount++;
+            if (std::abs(yValue - refYValue) <= tolerance &&
+                std::abs(uValue - refUValue) <= tolerance &&
+                std::abs(vValue - refVValue) <= tolerance) {
+                similarCount++;
+            }
+        }
+    }
+
+    if (sampledCount <= 0) {
+        return JNI_FALSE;
+    }
+    return (static_cast<float>(similarCount) / static_cast<float>(sampledCount)) >= threshold
+        ? JNI_TRUE
+        : JNI_FALSE;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
 Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_nv12ScaleToI420(
     JNIEnv* env, jclass,
     jobject srcY, jint srcStrideY,
@@ -526,4 +596,72 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_argbScale(
         return nullptr;
     }
     return dstBitmap;
+}
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_argbIsMostlySolidColor(
+    JNIEnv* env, jclass,
+    jobject bitmap,
+    jfloat threshold,
+    jint tolerance)
+{
+    AndroidBitmapInfo info = {};
+    if (AndroidBitmap_getInfo(env, bitmap, &info) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        return JNI_FALSE;
+    }
+    if (info.format != ANDROID_BITMAP_FORMAT_RGBA_8888 || info.width <= 0 || info.height <= 0) {
+        return JNI_FALSE;
+    }
+
+    uint8_t* pixels = nullptr;
+    if (AndroidBitmap_lockPixels(env, bitmap, reinterpret_cast<void**>(&pixels)) != ANDROID_BITMAP_RESULT_SUCCESS) {
+        return JNI_FALSE;
+    }
+
+    const int width = static_cast<int>(info.width);
+    const int height = static_cast<int>(info.height);
+    const int marginX = width / 10;
+    const int marginY = height / 10;
+    const int sampleAreaRight = width - marginX;
+    const int sampleAreaBottom = height - marginY;
+    constexpr int gridSize = 10;
+    const int stepX = (sampleAreaRight - marginX) / gridSize;
+    const int stepY = (sampleAreaBottom - marginY) / gridSize;
+    if (stepX <= 0 || stepY <= 0) {
+        AndroidBitmap_unlockPixels(env, bitmap);
+        return JNI_FALSE;
+    }
+
+    const uint8_t* ref = pixels + marginY * info.stride + marginX * 4;
+    const int ref0 = ref[0];
+    const int ref1 = ref[1];
+    const int ref2 = ref[2];
+
+    int sampledCount = 0;
+    int similarCount = 0;
+    for (int x = 0; x < gridSize; x++) {
+        for (int y = 0; y < gridSize; y++) {
+            const int pixelX = marginX + x * stepX;
+            const int pixelY = marginY + y * stepY;
+            if (pixelX >= width || pixelY >= height) {
+                continue;
+            }
+
+            const uint8_t* pixel = pixels + pixelY * info.stride + pixelX * 4;
+            sampledCount++;
+            if (std::abs(static_cast<int>(pixel[0]) - ref0) <= tolerance &&
+                std::abs(static_cast<int>(pixel[1]) - ref1) <= tolerance &&
+                std::abs(static_cast<int>(pixel[2]) - ref2) <= tolerance) {
+                similarCount++;
+            }
+        }
+    }
+
+    AndroidBitmap_unlockPixels(env, bitmap);
+    if (sampledCount <= 0) {
+        return JNI_FALSE;
+    }
+    return (static_cast<float>(similarCount) / static_cast<float>(sampledCount)) >= threshold
+        ? JNI_TRUE
+        : JNI_FALSE;
 }
