@@ -203,6 +203,8 @@ struct AssContext {
     ASS_Renderer* renderer = nullptr;
     ASS_Track*    track    = nullptr;
     int width    = 0, height   = 0;
+    // PlayRes from the ASS script — must stay ass_set_storage_size, NOT the frame size.
+    int playResX = 0, playResY = 0;
     int ycbcrMatrix = 0;
     char* fontconfigPath = nullptr;
     std::mutex renderMutex;
@@ -407,8 +409,21 @@ struct AssContext {
         return true;
     }
 
+    void applyStorageSize() {
+#if HAS_LIBASS
+        if (!renderer) return;
+        // storage_size = script PlayRes (coordinate space); frame_size = output pixels.
+        if (playResX > 0 && playResY > 0) {
+            ass_set_storage_size(renderer, playResX, playResY);
+        } else if (width > 0 && height > 0) {
+            ass_set_storage_size(renderer, width, height);
+        }
+#endif
+    }
+
     void clearSurface() {
-        eglMakeCurrent(egl.display, egl.surface, egl.surface, egl.context);
+        if (!egl.valid()) return;
+        if (!eglMakeCurrent(egl.display, egl.surface, egl.surface, egl.context)) return;
         glViewport(0, 0, width, height);
         glClearColor(0.f, 0.f, 0.f, 0.f);
         glClear(GL_COLOR_BUFFER_BIT);
@@ -578,7 +593,9 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeInit(
         ctx->renderer = ass_renderer_init(ctx->lib);
         if (ctx->renderer) {
             ass_set_shaper(ctx->renderer, ASS_SHAPING_COMPLEX);
-            ass_set_hinting(ctx->renderer, ASS_HINTING_LIGHT);
+            // mpv uses ASS_HINTING_NONE — light hinting warps CJK glyph metrics.
+            ass_set_hinting(ctx->renderer, ASS_HINTING_NONE);
+            ass_set_line_position(ctx->renderer, 0.0);
             const char* cfg = configPath ? env->GetStringUTFChars(configPath, nullptr) : nullptr;
             if (cfg) LOGD("fontconfig: %s", cfg);
             ass_set_fonts(ctx->renderer, nullptr, nullptr, ASS_FONTPROVIDER_AUTODETECT, cfg, 1);
@@ -604,7 +621,8 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeSetFontsDir(
     if (ctx->lib) {
         scan_fonts_dir(ctx->lib, p);
         if (ctx->renderer)
-            ass_set_fonts(ctx->renderer, nullptr, "sans-serif", 1, nullptr, 1);
+            ass_set_fonts(ctx->renderer, nullptr, "sans-serif", ASS_FONTPROVIDER_AUTODETECT,
+                          ctx->fontconfigPath, 1);
         ctx->frameDirty = true;
     }
 #endif
@@ -622,16 +640,19 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeLoadTrack(
     ctx->frameDirty = true;
 #if HAS_LIBASS
     if (ctx->track) { ass_free_track(ctx->track); ctx->track = nullptr; }
+    ctx->playResX = 0;
+    ctx->playResY = 0;
     if (ctx->lib && data && length > 0) {
         jbyte* buf = env->GetByteArrayElements(data, nullptr);
         ctx->track = ass_read_memory(ctx->lib, reinterpret_cast<char*>(buf), length, "UTF-8");
         env->ReleaseByteArrayElements(data, buf, JNI_ABORT);
         if (ctx->track) {
             ass_track_set_feature(ctx->track, ASS_FEATURE_WRAP_UNICODE, 1);
-            int rx = ctx->track->PlayResX, ry = ctx->track->PlayResY;
-            if (rx > 0 && ry > 0 && ctx->renderer) {
-                ass_set_storage_size(ctx->renderer, rx, ry);
-                LOGD("PlayRes: %dx%d", rx, ry);
+            ctx->playResX = ctx->track->PlayResX;
+            ctx->playResY = ctx->track->PlayResY;
+            ctx->applyStorageSize();
+            if (ctx->playResX > 0 && ctx->playResY > 0) {
+                LOGD("PlayRes: %dx%d", ctx->playResX, ctx->playResY);
             }
             ctx->ycbcrMatrix = ctx->track->YCbCrMatrix;
             LOGD("YCbCr matrix: 0x%02x", ctx->ycbcrMatrix);
@@ -665,16 +686,16 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeProcessAssChunk(
 {
     AssContext* ctx = reinterpret_cast<AssContext*>(handle);
     if (!ctx || !ctx->track) return;
+    if (length <= 0) return;
     jbyte* buf = env->GetByteArrayElements(data, nullptr);
     if (!buf) return;
     std::lock_guard<std::mutex> lock(ctx->renderMutex);
     ctx->frameDirty = true;
 #if HAS_LIBASS
     ass_process_chunk(ctx->track, reinterpret_cast<char*>(buf), length, timecode, duration);
-    int rx = ctx->track->PlayResX, ry = ctx->track->PlayResY;
-    if (rx > 0 && ry > 0 && ctx->renderer) {
-        ass_set_storage_size(ctx->renderer, rx, ry);
-    }
+    ctx->playResX = ctx->track->PlayResX;
+    ctx->playResY = ctx->track->PlayResY;
+    ctx->applyStorageSize();
     ctx->ycbcrMatrix = ctx->track->YCbCrMatrix;
 #endif
     env->ReleaseByteArrayElements(data, buf, JNI_ABORT);
@@ -721,7 +742,10 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeSetFrameSize(
 #if HAS_LIBASS
     if (ctx->renderer && width > 0 && height > 0) {
         ass_set_frame_size(ctx->renderer, width, height);
-        ass_set_storage_size(ctx->renderer, width, height);
+        // Keep script PlayRes as storage size so \pos/\an scale like mpv/libass.
+        ctx->applyStorageSize();
+        ass_set_pixel_aspect(ctx->renderer, 1.0);
+        ass_set_shaper(ctx->renderer, ASS_SHAPING_COMPLEX);
     }
 #endif
 }
@@ -753,7 +777,18 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeSetStyleOverride
     if (!applyEmbeddedStyles) {
         ctx->ycbcrMatrix = YCBCR_NONE;
         ASS_Style style = {};
-        style.FontSize = fontSize > 0.f ? (double)fontSize : 20.0;
+        // UI size is authored against a ~280-unit PlayRes; scale into script space
+        // so embedded-override mode matches mpv's visual size across PlayRes variants.
+        {
+            double playRes = ctx->playResY > 0 ? (double)ctx->playResY
+                            : (ctx->height > 0 ? (double)ctx->height : 280.0);
+            double base = fontSize > 0.f ? (double)fontSize : 20.0;
+            double playScale = playRes / 280.0;
+            style.FontSize = base * playScale;
+            // Border width must track font size or outlines disappear at large PlayRes.
+            style.Outline = 2.0 * playScale;
+            style.Shadow = 0.0;
+        }
         uint8_t a = (textColor >> 24) & 0xFF;
         uint8_t r = (textColor >> 16) & 0xFF;
         uint8_t g = (textColor >>  8) & 0xFF;
@@ -762,8 +797,9 @@ Java_com_sakurafubuki_yume_feature_player_ass_AssRenderer_nativeSetStyleOverride
         style.SecondaryColour = style.PrimaryColour;
         style.OutlineColour   = 0x000000FF;
         style.BackColour      = showBackground ? 0x000000FF : 0x00000000;
-        style.Outline = 2.0; style.Shadow = 1.0;
         style.BorderStyle = 1; style.ScaleX = 1.0; style.ScaleY = 1.0;
+        style.Spacing = 0.0; style.Angle = 0.0;
+        style.Bold = 0; style.Italic = 0;
         ass_set_selective_style_override(ctx->renderer, &style);
         int bits = ASS_OVERRIDE_BIT_FONT_SIZE_FIELDS
                  | ASS_OVERRIDE_BIT_COLORS
