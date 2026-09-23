@@ -5,12 +5,17 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #define TAG "YuvToBitmap"
 
 #define LOGD(...) ((void)0)
-#define LOGE(...) ((void)0)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
+
+extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM* /*vm*/, void* /*reserved*/) {
+    return JNI_VERSION_1_6;
+}
 
 enum {
     COLOR_STANDARD_BT709     = 1,
@@ -38,23 +43,67 @@ static const libyuv::YuvConstants* selectYuvMatrix(jint colorStandard, jint colo
     }
 }
 
+struct BitmapFactoryIds {
+    jclass bitmapClass = nullptr;
+    jmethodID createBitmap = nullptr;
+    jobject config = nullptr;
+    bool ok = false;
+};
+
+static const BitmapFactoryIds& bitmapFactoryIds(JNIEnv* env) {
+    static BitmapFactoryIds ids;
+    static std::once_flag once;
+    std::call_once(once, [env] {
+        jclass localBitmap = env->FindClass("android/graphics/Bitmap");
+        jclass localConfig = env->FindClass("android/graphics/Bitmap$Config");
+        if (!localBitmap || !localConfig) return;
+        ids.bitmapClass = (jclass) env->NewGlobalRef(localBitmap);
+        jmethodID createBitmap = env->GetStaticMethodID(
+            ids.bitmapClass, "createBitmap",
+            "(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;");
+        jfieldID argb8888Field = env->GetStaticFieldID(
+            localConfig, "ARGB_8888", "Landroid/graphics/Bitmap$Config;");
+        jobject localConfigObj = env->GetStaticObjectField(localConfig, argb8888Field);
+        if (createBitmap && localConfigObj) {
+            ids.createBitmap = createBitmap;
+            ids.config = env->NewGlobalRef(localConfigObj);
+            ids.ok = true;
+        }
+        env->DeleteLocalRef(localBitmap);
+        env->DeleteLocalRef(localConfig);
+        if (localConfigObj) env->DeleteLocalRef(localConfigObj);
+    });
+    return ids;
+}
+
 static jobject createArgbBitmap(JNIEnv* env, jint width, jint height) {
-    static jclass bitmapClass = (jclass) env->NewGlobalRef(
-        env->FindClass("android/graphics/Bitmap"));
-    static jmethodID createBitmap = env->GetStaticMethodID(
-        bitmapClass, "createBitmap",
-        "(IILandroid/graphics/Bitmap$Config;)Landroid/graphics/Bitmap;");
-    static jclass configClass = (jclass) env->NewGlobalRef(
-        env->FindClass("android/graphics/Bitmap$Config"));
-    static jfieldID argb8888Field = env->GetStaticFieldID(
-        configClass, "ARGB_8888", "Landroid/graphics/Bitmap$Config;");
-    static jobject config = env->NewGlobalRef(
-        env->GetStaticObjectField(configClass, argb8888Field));
+    if (width <= 0 || height <= 0) return nullptr;
+    // Guard against absurd allocations that later confuse libyuv strides.
+    if (width > 8192 || height > 8192) return nullptr;
+    const auto& ids = bitmapFactoryIds(env);
+    if (!ids.ok) return nullptr;
+    return env->CallStaticObjectMethod(ids.bitmapClass, ids.createBitmap, width, height, ids.config);
+}
 
-    if (!bitmapClass || !createBitmap || !configClass || !argb8888Field || !config)
-        return nullptr;
+static uint8_t* directBufferPtr(JNIEnv* env, jobject buf) {
+    if (!buf) return nullptr;
+    return static_cast<uint8_t*>(env->GetDirectBufferAddress(buf));
+}
 
-    return env->CallStaticObjectMethod(bitmapClass, createBitmap, width, height, config);
+// GetDirectBufferAddress ignores ByteBuffer.position(); add it back.
+static jint bufferPosition(JNIEnv* env, jobject buf) {
+    if (!buf) return 0;
+    jclass cls = env->GetObjectClass(buf);
+    jmethodID mid = env->GetMethodID(cls, "position", "()I");
+    env->DeleteLocalRef(cls);
+    if (!mid) return 0;
+    return env->CallIntMethod(buf, mid);
+}
+
+static uint8_t* planePtr(JNIEnv* env, jobject buf) {
+    uint8_t* base = directBufferPtr(env, buf);
+    if (!base) return nullptr;
+    return base + bufferPosition(env, buf);
 }
 
 struct BitmapLock {
@@ -95,9 +144,9 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_imageToBitmap(
 {
     if (cropWidth <= 0 || cropHeight <= 0) return nullptr;
 
-    auto* yPtr = static_cast<uint8_t*>(env->GetDirectBufferAddress(yBuf));
-    auto* uPtr = static_cast<uint8_t*>(env->GetDirectBufferAddress(uBuf));
-    auto* vPtr = static_cast<uint8_t*>(env->GetDirectBufferAddress(vBuf));
+    auto* yPtr = planePtr(env, yBuf);
+    auto* uPtr = planePtr(env, uBuf);
+    auto* vPtr = planePtr(env, vBuf);
 
     if (!yPtr || !uPtr || !vPtr) {
         LOGE("imageToBitmap: one or more planes are not direct buffers");
@@ -200,7 +249,7 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_bufferToBitmap
 {
     if (cropWidth <= 0 || cropHeight <= 0) return nullptr;
 
-    auto* data = static_cast<uint8_t*>(env->GetDirectBufferAddress(yuvBuffer));
+    auto* data = planePtr(env, yuvBuffer);
     if (!data) {
         LOGE("bufferToBitmap: buffer is not a direct buffer");
         return nullptr;
@@ -322,12 +371,12 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_i420Scale(
         return JNI_FALSE;
     }
 
-    auto* pSrcY = static_cast<uint8_t*>(env->GetDirectBufferAddress(srcY));
-    auto* pSrcU = static_cast<uint8_t*>(env->GetDirectBufferAddress(srcU));
-    auto* pSrcV = static_cast<uint8_t*>(env->GetDirectBufferAddress(srcV));
-    auto* pDstY = static_cast<uint8_t*>(env->GetDirectBufferAddress(dstY));
-    auto* pDstU = static_cast<uint8_t*>(env->GetDirectBufferAddress(dstU));
-    auto* pDstV = static_cast<uint8_t*>(env->GetDirectBufferAddress(dstV));
+    auto* pSrcY = planePtr(env, srcY);
+    auto* pSrcU = planePtr(env, srcU);
+    auto* pSrcV = planePtr(env, srcV);
+    auto* pDstY = planePtr(env, dstY);
+    auto* pDstU = planePtr(env, dstU);
+    auto* pDstV = planePtr(env, dstV);
 
     if (!pSrcY || !pSrcU || !pSrcV || !pDstY || !pDstU || !pDstV) {
         LOGE("i420Scale: one or more planes are not direct buffers");
@@ -441,11 +490,11 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_nv12ScaleToI42
         return JNI_FALSE;
     }
 
-    auto* pSrcY  = static_cast<uint8_t*>(env->GetDirectBufferAddress(srcY));
-    auto* pSrcUV = static_cast<uint8_t*>(env->GetDirectBufferAddress(srcUV));
-    auto* pDstY  = static_cast<uint8_t*>(env->GetDirectBufferAddress(dstY));
-    auto* pDstU  = static_cast<uint8_t*>(env->GetDirectBufferAddress(dstU));
-    auto* pDstV  = static_cast<uint8_t*>(env->GetDirectBufferAddress(dstV));
+    auto* pSrcY  = planePtr(env, srcY);
+    auto* pSrcUV = planePtr(env, srcUV);
+    auto* pDstY  = planePtr(env, dstY);
+    auto* pDstU  = planePtr(env, dstU);
+    auto* pDstV  = planePtr(env, dstV);
 
     if (!pSrcY || !pSrcUV || !pDstY || !pDstU || !pDstV) {
         LOGE("nv12ScaleToI420: one or more planes are not direct buffers");
@@ -454,10 +503,18 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_nv12ScaleToI42
 
     const size_t tmpYSize = static_cast<size_t>(dstStrideY) * static_cast<size_t>(dstHeight);
     const size_t tmpUVSize = static_cast<size_t>(dstStrideY) * static_cast<size_t>((dstHeight + 1) / 2);
+    if (tmpYSize == 0 || tmpUVSize == 0) {
+        LOGE("nv12ScaleToI420: empty temp buffer");
+        return JNI_FALSE;
+    }
     thread_local std::vector<uint8_t> tmpY;
     thread_local std::vector<uint8_t> tmpUV;
     tmpY.resize(tmpYSize);
     tmpUV.resize(tmpUVSize);
+    if (tmpY.data() == nullptr || tmpUV.data() == nullptr) {
+        LOGE("nv12ScaleToI420: temp allocation failed (%zu / %zu)", tmpYSize, tmpUVSize);
+        return JNI_FALSE;
+    }
 
     int ret = libyuv::NV12Scale(
         pSrcY, srcStrideY,
@@ -524,6 +581,26 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_compositeToShe
         return JNI_FALSE;
     }
 
+    // Cell size is the sprite grid slot; the frame bitmap must already match it.
+    // Mismatched size (e.g. after 90/270 rotation) would overrun both buffers.
+    if (frameInfo.width != static_cast<uint32_t>(frameWidth) ||
+        frameInfo.height != static_cast<uint32_t>(frameHeight)) {
+        LOGE("compositeToSheet: frame %ux%u != cell %dx%d",
+             frameInfo.width, frameInfo.height, frameWidth, frameHeight);
+        return JNI_FALSE;
+    }
+    if (col < 0 || row < 0 || frameWidth <= 0 || frameHeight <= 0) {
+        return JNI_FALSE;
+    }
+    const uint32_t dstXBytes = static_cast<uint32_t>(col) * static_cast<uint32_t>(frameWidth) * 4u;
+    const uint32_t dstYRows = static_cast<uint32_t>(row) * static_cast<uint32_t>(frameHeight);
+    if (dstXBytes + static_cast<uint32_t>(frameWidth) * 4u > sheetInfo.stride ||
+        dstYRows + static_cast<uint32_t>(frameHeight) > sheetInfo.height) {
+        LOGE("compositeToSheet: cell (%d,%d) overflows sheet %ux%u stride=%u",
+             col, row, sheetInfo.width, sheetInfo.height, sheetInfo.stride);
+        return JNI_FALSE;
+    }
+
     uint8_t* framePixels = nullptr;
     uint8_t* sheetPixels = nullptr;
     if (AndroidBitmap_lockPixels(env, frameBitmap, reinterpret_cast<void**>(&framePixels)) < 0) {
@@ -536,12 +613,9 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_compositeToShe
         return JNI_FALSE;
     }
 
-    const int dstX = col * frameWidth * 4;
-    const int dstY = row * frameHeight;
-
     libyuv::ARGBCopy(
         framePixels, frameInfo.stride,
-        sheetPixels + dstY * sheetInfo.stride + dstX, sheetInfo.stride,
+        sheetPixels + dstYRows * sheetInfo.stride + dstXBytes, sheetInfo.stride,
         frameWidth, frameHeight);
 
     AndroidBitmap_unlockPixels(env, sheetBitmap);
@@ -561,6 +635,10 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_argbScale(
     AndroidBitmapInfo srcInfo = {};
     if (AndroidBitmap_getInfo(env, srcBitmap, &srcInfo) != ANDROID_BITMAP_RESULT_SUCCESS)
         return nullptr;
+    if (srcInfo.width <= 0 || srcInfo.height <= 0 || srcInfo.stride < srcInfo.width * 4) {
+        LOGE("argbScale: bad source bitmap %ux%u stride=%u", srcInfo.width, srcInfo.height, srcInfo.stride);
+        return nullptr;
+    }
 
     BitmapLock srcLock(env, srcBitmap);
     if (!srcLock.ok()) return nullptr;
@@ -570,6 +648,11 @@ Java_com_sakurafubuki_yume_core_data_repository_YuvToBitmapBridge_argbScale(
 
     BitmapLock dstLock(env, dstBitmap);
     if (!dstLock.ok()) {
+        env->DeleteLocalRef(dstBitmap);
+        return nullptr;
+    }
+    if (dstLock.stride() < dstWidth * 4) {
+        LOGE("argbScale: bad dest stride %d for width %d", dstLock.stride(), dstWidth);
         env->DeleteLocalRef(dstBitmap);
         return nullptr;
     }
